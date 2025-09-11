@@ -1,0 +1,116 @@
+services:
+  app:
+    build: .
+    container_name: rag_app
+    restart: always
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - DATABASE__HOST=postgres
+      - DATABASE__PORT=5432
+      - DATABASE__NAME=ragdb
+      - DATABASE__USER=raguser
+      - DATABASE__PASSWORD=ragpass
+      - ELASTICSEARCH__HOST=elasticsearch
+      - ELASTICSEARCH__PORT=9200
+      - ELASTICSEARCH__USERNAME=
+      - ELASTICSEARCH__PASSWORD=
+      - AI__OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - AI__EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-small}
+      - AI__EMBEDDING_DIMENSIONS=${EMBEDDING_DIMENSIONS:-1536}
+      - AI__LLM_MODEL=${LLM_MODEL:-gpt-3.5-turbo}
+      - AI__MAX_TOKENS=${MAX_TOKENS:-2000}
+      - AI__SEARCH_TOP_K=${SEARCH_TOP_K:-10}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM__ADMIN_TELEGRAM_IDS=${TELEGRAM__ADMIN_TELEGRAM_IDS:-}
+      - TELEGRAM__CLIENT_IDS=${TELEGRAM_CLIENT_IDS:-}
+      - STORAGE__UPLOAD_DIR=storage
+      - STORAGE__MAX_FILE_SIZE=262144000
+      - APP_BASE_URL=${APP_BASE_URL:-http://localhost:8000}
+      - DEBUG=${DEBUG:-false}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - rag_network
+    entrypoint: ["sh", "/app/entrypoint.sh"]
+
+  postgres:
+    image: postgres:17
+    container_name: rag_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: raguser
+      POSTGRES_PASSWORD: ragpass
+      POSTGRES_DB: ragdb
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raguser -d ragdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - rag_network
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: rag_elasticsearch
+    restart: always
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - rag_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: rag_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    command: redis-server --appendonly yes
+    networks:
+      - rag_network
+
+volumes:
+  pgdata:
+    driver: local
+  esdata:
+    driver: local
+  redisdata:
+    driver: local
+
+networks:
+  rag_network:
+    driver: bridge

@@ -1,0 +1,56 @@
+# FastAPI and server
+fastapi==0.115.0
+uvicorn[standard]==0.31.0
+
+# Telegram bot
+aiogram==3.13.1
+
+# File handling
+python-multipart==0.0.12
+
+# Data validation and settings
+pydantic==2.9.2
+pydantic-settings==2.5.2
+
+# Database
+SQLAlchemy==2.0.35
+psycopg2-binary==2.9.9
+alembic==1.13.2
+
+# Vector search
+elasticsearch>=8.12.0,<9.0.0
+
+# LangChain and AI
+langchain==0.3.1
+langchain-community==0.3.1
+langchain-core==0.3.6
+langchain-openai==0.2.1
+langchain-text-splitters==0.3.0
+
+# OpenAI and alternatives
+openai==1.50.2
+tiktoken==0.7.0
+
+# Document parsing
+pypdf==4.2.0
+pdfplumber==0.11.0
+python-docx==1.1.2
+markdown==3.6
+
+# Image handling
+pillow==10.4.0
+
+# File type detection
+filetype==1.2.0
+python-magic==0.4.27
+
+# Logging and retries
+loguru==0.7.2
+tenacity==8.5.0
+
+# Environment variables
+python-dotenv==1.0.1
+
+# Additional utilities
+httpx==0.27.2
+aiofiles==24.1.0
