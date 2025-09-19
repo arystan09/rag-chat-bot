@@ -51,84 +51,136 @@ def get_conversation_history(db: Session, conversation_id: str, user_id: int, li
         return []
 
 
-def call_llm(context: str, question: str, conversation_history: List[dict] = None) -> tuple[str, int, int]:
+def call_llm(context_gists: List[str], full_context: str, question: str, conversation_history: List[dict] = None) -> tuple[str, int, int]:
     """
-    Call LLM with context and conversation history.
+    Call LLM with dual context (gists + full chunks) and conversation history.
     
     Args:
-        context: Retrieved document context
+        context_gists: Short gists extracted from top chunks
+        full_context: Concatenated best chunks text
         question: User question
         conversation_history: Previous conversation exchanges
         
     Returns:
-        Tuple of (answer, token_in, token_out)
+        Tuple of (answer_text, token_in, token_out)
     """
     try:
         from openai import OpenAI
+        import json as _json
         
         if not settings.ai.openai_api_key:
             logger.warning("OpenAI API key not configured")
             return "⚠️ OpenAI временно недоступен. Попробуйте позже.", 0, 0
         
         logger.info(f"Calling LLM with model: {settings.ai.llm_model}")
-        logger.debug(f"Context length: {len(context)} characters")
+        logger.info(f"LLM input: gists={len(context_gists)}, full_chunks_chars={len(full_context)}")
         logger.debug(f"Question: {question}")
         logger.debug(f"Conversation history entries: {len(conversation_history or [])}")
         
         client = OpenAI(api_key=settings.ai.openai_api_key)
         
-        # Build messages with conversation history
+        # Build messages with conversation history and strict JSON instruction
         messages = [
             {
-                "role": "system", 
-                "content": "Ты - помощник по документам. Отвечай на русском языке на основе предоставленного контекста."
+                "role": "system",
+                "content": (
+                    "Вы — умный, вежливый и лаконичный ассистент-помощник для внутренних документов компании. "
+                    "Отвечайте по-русски. Всегда: "
+                    "- Кратко: максимум 3–5 предложений в основном ответе (если не просят развернуть). "
+                    "- Сначала давайте однострочную подсказку о темах: \"Можно: … | Нельзя: …\" (макс 1 предложение). "
+                    "- Если для корректного ответа не хватает информации — задайте 1 короткий уточняющий вопрос (макс 12 слов). "
+                    "- Форматируйте источники так: `📄 {filename} — {url}` (plain URL, без HTML). "
+                    "- Не используйте лишние символы/звёздочки/повторяющиеся переносы строк. "
+                    "- Возвращайте строго JSON-объект по схеме. "
+                    "Правила ответов: Если вопрос про документы (виза/поступление и т.п.) — перечисли ВСЕ найденные пункты нумерованно (1., 2., 3., …), не сокращай. "
+                    "Если вопрос про медстраховку — если в тексте прямо не сказано, ответь: \"В документах это не указано\" и предложи уточнить у консульства. "
+                    "Не придумывай фактов. Если данных нет — скажи \"Нет данных\"."
+                ),
             }
         ]
         
-        # Add conversation history
+        # Add conversation history (last 3), before full context
         if conversation_history:
             messages.append({"role": "system", "content": "ПРЕДЫДУЩИЙ ДИАЛОГ:"})
             for exchange in conversation_history[-3:]:  # Last 3 exchanges
                 messages.append({"role": "user", "content": exchange["question"]})
                 messages.append({"role": "assistant", "content": exchange["answer"]})
         
-        # Add current context and question
-        prompt = f"""КОНТЕКСТ ДОКУМЕНТОВ:
-{context}
-
-ТЕКУЩИЙ ВОПРОС: {question}
-
-ИНСТРУКЦИИ:
-1. Отвечай ТОЛЬКО на русском языке
-2. Используй информацию ТОЛЬКО из предоставленного контекста
-3. Если информации нет в контексте - скажи об этом честно
-4. Структурируй ответ логично и понятно
-5. Не выдумывай информацию, которой нет в контексте
-6. Отвечай подробно и структурированно
-7. Если есть несколько аспектов вопроса - рассмотри их все
-8. Используй конкретные детали из документов (цифры, даты, названия)
-9. ВАЖНО: Если вопрос короткий и неясный (например, "Что за университет?"), попробуй понять его в контексте предыдущих вопросов в диалоге. Если в предыдущем диалоге обсуждалась тема визы или поступления, то "университет" скорее всего относится к университету, в который планируется поступление.
-
-ОТВЕТ:"""
+        # Prepare dual context
+        gists_block = "\n".join([f"- {g}" for g in context_gists]) if context_gists else "- Нет данных"
+        full_block = full_context if full_context else ""
         
+        # Build user prompt with strict output schema
+        prompt = (
+            "[GISTS]\n"
+            f"{gists_block}\n\n"
+            "[FULL CONTEXT]\n"
+            f"{full_block}\n\n"
+            "[QUESTION]\n"
+            f"{question}\n\n"
+            "[OUTPUT SCHEMA]\n"
+            "Верни строго JSON без пояснений:\n"
+            "{\n"
+            "  \"one_line_topics\": \"Можно: ... | Нельзя: ...\",\n"
+            "  \"answer\": \"...\",\n"
+            "  \"steps\": [\"1. ...\", \"2. ...\"],\n"
+            "  \"citations\": [{\"filename\":\"...\", \"url\":\"...\", \"snippet\":\"...\"}],\n"
+            "  \"clarifying_question\": null,\n"
+            "  \"confidence\": \"high|medium|low\"\n"
+            "}"
+        )
         messages.append({"role": "user", "content": prompt})
+
+        logger.info(f"Prompt length (chars): {len(prompt)}")
         
-        logger.debug(f"Sending request to OpenAI with {len(messages)} messages")
-        
+        # Send request
         response = client.chat.completions.create(
             model=settings.ai.llm_model,
             messages=messages,
             max_tokens=settings.ai.max_tokens,
-            temperature=0.7
+            temperature=0.9,
+            top_p=0.9,
+            frequency_penalty=0.2,
         )
         
-        answer = response.choices[0].message.content
+        raw = response.choices[0].message.content or ""
         token_in = response.usage.prompt_tokens
         token_out = response.usage.completion_tokens
         
-        logger.info(f"LLM response received: {len(answer)} characters, tokens: {token_in} in, {token_out} out")
+        logger.info(f"LLM response received: {len(raw)} characters, tokens: {token_in} in, {token_out} out")
+
+        # Robust JSON parsing with cleanup and fallback
+        fallback_json = {
+            "one_line_topics": "Нет данных",
+            "answer": "Нет данных",
+            "steps": [],
+            "citations": [],
+            "clarifying_question": None,
+            "confidence": "low"
+        }
+        parsed = None
+        try:
+            parsed = _json.loads(raw)
+        except Exception:
+            try:
+                start = raw.find('{')
+                end = raw.rfind('}')
+                if start != -1 and end != -1 and end > start:
+                    cleaned = raw[start:end+1]
+                    parsed = _json.loads(cleaned)
+            except Exception:
+                parsed = None
+        if not isinstance(parsed, dict):
+            parsed = fallback_json
+        # Ensure minimal fields
+        for key in fallback_json.keys():
+            if key not in parsed:
+                parsed[key] = fallback_json[key]
+        final_answer = parsed.get("answer") or fallback_json["answer"]
+        if not final_answer or not str(final_answer).strip():
+            final_answer = fallback_json["answer"]
         
-        return answer, token_in, token_out
+        return final_answer, token_in, token_out
         
     except ImportError:
         logger.warning("OpenAI library not installed")
@@ -169,12 +221,13 @@ async def chat_query(request: QueryRequest):
         
         # Perform hybrid search with more candidates
         logger.info(f"Performing hybrid search for: {request.question}")
-        search_results = hybrid_search(request.question, min(request.top_k * 2, 15))  # Get more candidates
+        # Retrieve more candidates to improve recall for list-style questions
+        search_results = hybrid_search(request.question, max(12, min(request.top_k * 4, 30)))
         
         if not search_results:
             logger.warning("No search results found")
             return QueryResponse(
-                answer="К сожалению, я не смог найти релевантную информацию в ваших документах для ответа на этот вопрос.",
+                answer="В документах этого нет.",
                 retrieved_chunks=[],
                 citations=[],
                 model=settings.ai.llm_model,
@@ -190,44 +243,36 @@ async def chat_query(request: QueryRequest):
         context_parts = []
         retrieved_chunks = []
         
-        # Filter and rank chunks by relevance with improved logic
-        filtered_results = []
-        for result in search_results:
-            # Calculate relevance score based on multiple factors
-            text = result['text'].lower()
-            question_words = request.question.lower().split()
-            
-            # Factor 1: Keyword matches (weight: 0.3)
-            keyword_matches = sum(1 for word in question_words if word in text)
-            keyword_score = keyword_matches / len(question_words) if question_words else 0
-            
-            # Factor 2: Original search score (weight: 0.7)
-            search_score = result['score']
-            
-            # Factor 3: Text length penalty (shorter texts are often more relevant)
-            length_penalty = min(1.0, 500 / len(text)) if len(text) > 0 else 0
-            
-            # Combined relevance score
-            relevance_score = (0.3 * keyword_score + 0.7 * search_score) * length_penalty
-            
-            # Only include results with minimum relevance threshold
-            if relevance_score >= 0.3:  # Higher threshold for better relevance
-                result['relevance_score'] = relevance_score
-                filtered_results.append(result)
+        # Sort by combined score from search (already normalized)
+        search_results_sorted = sorted(search_results, key=lambda x: x['score'], reverse=True)
         
-        # Sort by relevance score and take only the best result
-        filtered_results.sort(key=lambda x: x['relevance_score'], reverse=True)
-        top_results = filtered_results[:1]  # Only return the most relevant result
+        # Dynamically select top chunks
+        ql = request.question.lower()
+        want_full_list = any(kw in ql for kw in ["список", "перечень", "весь список", "все пункты", "полный список", "все документы"])
+        top_keep = 12 if want_full_list else 6
         
-        logger.info(f"Selected top {len(top_results)} results for context")
-        logger.info(f"Top results scores: {[r['score'] for r in top_results]}")
-        logger.info(f"Top results filenames: {[r['filename'] for r in top_results]}")
+        # Apply a gentle minimum score threshold but fallback to top_keep if none pass
+        MIN_SCORE = 0.1
+        candidates = [r for r in search_results_sorted if r.get('score', 0.0) >= MIN_SCORE]
+        if not candidates:
+            candidates = search_results_sorted
+        top_results = candidates[:top_keep]
+        
+        # Log top-3 chunk ids/files/scores
+        top3_preview = [
+            {
+                'doc_id': r.get('doc_id', ''),
+                'filename': r.get('filename', ''),
+                'score': round(r.get('score', 0.0), 3)
+            } for r in top_results[:3]
+        ]
+        logger.info(f"Selected top {len(top_results)} results; preview: {top3_preview}")
         
         # If no relevant results found, return appropriate response
         if not top_results:
             logger.warning("No relevant results found for query")
             return QueryResponse(
-                answer="К сожалению, в предоставленных документах нет информации, которая позволила бы ответить на ваш вопрос.",
+                answer="В документах этого нет.",
                 retrieved_chunks=[],
                 citations=[],
                 model=settings.ai.llm_model,
@@ -251,22 +296,35 @@ async def chat_query(request: QueryRequest):
                 image_urls=result['image_urls']
             ))
         
-        # Ensure we only have one chunk for citations
-        if len(retrieved_chunks) > 1:
-            # Keep only the chunk with highest score
-            retrieved_chunks = [max(retrieved_chunks, key=lambda x: x.score)]
+        # Create gists (<=25 words, first sentence heuristic) and keep 3–5
+        def _make_gist(text: str) -> str:
+            sentence = text.split('. ')[0].strip()
+            words = sentence.split()
+            if len(words) > 25:
+                return " ".join(words[:25]) + "..."
+            return sentence
+        max_gists = 5 if want_full_list else 3
+        context_gists = [_make_gist(r['text']) for r in top_results][:max_gists]
         
-        context = "\n\n".join(context_parts)
+        # Assemble full context with budget at chunk granularity (avoid cutting mid-chunk)
+        context_parts_joined = []
+        total_len = 0
+        max_context_length = 15000 if want_full_list else 7000
+        for part in context_parts:
+            if total_len + len(part) <= max_context_length:
+                context_parts_joined.append(part)
+                total_len += len(part)
+            else:
+                break
+        full_context = "\n\n".join(context_parts_joined)
         
-        # Truncate context if too long
-        max_context_length = 8000  # Adjust based on model limits
-        if len(context) > max_context_length:
-            context = context[:max_context_length] + "..."
-            logger.warning(f"Context truncated to {max_context_length} characters")
+        logger.info(f"Prepared context for LLM: gists={len(context_gists)}, full_chunks={len(context_parts_joined)}, full_len={len(full_context)}")
         
         # Call LLM with conversation history
         logger.info("Calling LLM for answer generation")
-        answer, token_in, token_out = call_llm(context, request.question, conversation_history)
+        answer, token_in, token_out = call_llm(context_gists, full_context, request.question, conversation_history)
+        if not answer or not answer.strip():
+            answer = "Нет данных"
         
         # Calculate latency
         latency_ms = int((time.time() - start_time) * 1000)
@@ -304,37 +362,27 @@ async def chat_query(request: QueryRequest):
         finally:
             db.close()
         
-        # Generate citations from retrieved chunks (only the most relevant)
+        # Generate citations from retrieved chunks (single highest-scoring source only)
         citations = []
-        seen_docs = set()
         
-        # Only include citations for chunks that meet relevance threshold
-        relevant_chunks = [chunk for chunk in retrieved_chunks if chunk.score >= 0.3]
-        
-        # Limit to only the most relevant chunk
-        if relevant_chunks:
-            relevant_chunks = [max(relevant_chunks, key=lambda x: x.score)]
-        
-        for chunk in relevant_chunks:
+        # Use only the single highest-scoring chunk for citation
+        if retrieved_chunks:
+            best_chunk = max(retrieved_chunks, key=lambda x: x.score)
             # Skip chunks with empty doc_id
-            if not chunk.doc_id or chunk.doc_id.strip() == '':
-                continue
-                
-            if chunk.doc_id not in seen_docs:
-                seen_docs.add(chunk.doc_id)
+            if best_chunk.doc_id and best_chunk.doc_id.strip():
                 # Get document public_url from database
                 db_citation = SessionLocal()
                 try:
                     from app.db.models import Document
-                    doc = db_citation.query(Document).filter(Document.id == chunk.doc_id).first()
+                    doc = db_citation.query(Document).filter(Document.id == best_chunk.doc_id).first()
                     if doc:
                         citations.append(Citation(
-                            filename=chunk.filename,
-                            public_url=doc.public_url or f"doc_id:{chunk.doc_id}",
-                            url=chunk.url or doc.url or f"{settings.app_base_url}/api/v1/docs/{chunk.doc_id}/download",
-                            doc_id=chunk.doc_id,
-                            snippet=chunk.text[:300] + '...' if len(chunk.text) > 300 else chunk.text,
-                            score=chunk.score
+                            filename=best_chunk.filename,
+                            public_url=doc.public_url or f"doc_id:{best_chunk.doc_id}",
+                            url=best_chunk.url or doc.url or f"{settings.app_base_url}/api/v1/docs/{best_chunk.doc_id}/download",
+                            doc_id=best_chunk.doc_id,
+                            snippet=best_chunk.text[:300] + '...' if len(best_chunk.text) > 300 else best_chunk.text,
+                            score=best_chunk.score
                         ))
                 finally:
                     db_citation.close()

@@ -68,6 +68,9 @@ class TelegramSettings(BaseSettings):
     admin_telegram_ids: List[str] = Field(default_factory=list, description="Admin Telegram IDs (comma-separated)")
     max_images_per_response: int = Field(default=4, description="Maximum images per bot response")
     max_images_per_chunk: int = Field(default=2, description="Maximum images per chunk")
+    max_message_length: int = Field(default=4000, description="Max Telegram message length")
+    max_citations: int = Field(default=3, description="Maximum citations to show")
+    dynamic_roles: bool = Field(default=True, description="Auto-update roles from admin_telegram_ids")
     
     @field_validator('admin_telegram_ids', mode='before')
     @classmethod

@@ -5,6 +5,18 @@ from loguru import logger
 from app.core.settings import settings
 from app.vector.elasticsearch.client import get_es
 
+# -----------------------------
+# Configurable constants
+# -----------------------------
+KNN_WEIGHT_DEFAULT: float = 0.7
+BM25_WEIGHT_DEFAULT: float = 0.3
+BM25_WEIGHT_ADAPTIVE: float = 0.5
+BM25_STRONG_SCORE_THRESHOLD: float = 0.7  # normalized
+BM25_STRONG_COUNT_THRESHOLD: int = 5      # number of distinct documents
+MIN_SCORE_THRESHOLD: float = 0.15         # filtered out if below (after final score)
+BOOST_FOR_DOMAIN_TERMS: float = 2.0
+BOOST_FOR_OTHER_TERMS: float = 1.0
+
 
 def hybrid_search(question: str, k: int = 3) -> List[Dict[str, Any]]:
     """
@@ -104,6 +116,53 @@ def perform_knn_search(query_embedding: List[float], k: int = 10) -> List[Dict[s
         return []
 
 
+def _expand_query_terms(question: str) -> List[Tuple[str, float]]:
+    """
+    Generate simple query expansion terms with per-term boost.
+    Heuristics only (no LLM): synonyms, morphological variants, key domain terms.
+    Returns a list of (term, boost) pairs.
+    """
+    q = (question or "").lower()
+    terms: Dict[str, float] = {}
+
+    def add_term(term: str, boost: float) -> None:
+        t = term.strip()
+        if not t:
+            return
+        # Keep the max boost if duplicate
+        current = terms.get(t, 0.0)
+        if boost > current:
+            terms[t] = boost
+
+    # base tokens
+    for token in q.replace(',', ' ').replace('.', ' ').split():
+        token = token.strip()
+        if not token:
+            continue
+        add_term(token, BOOST_FOR_OTHER_TERMS)
+        # naive singular/plural
+        if token.endswith('ы') or token.endswith('и'):
+            add_term(token[:-1], BOOST_FOR_OTHER_TERMS)
+        if token.endswith('а'):
+            add_term(token[:-1], BOOST_FOR_OTHER_TERMS)
+
+    # domain expansions (boosted)
+    if 'список' in q or 'перечень' in q:
+        for t in ['перечень', 'список', 'пункты', 'требования', 'документы', 'список документов', 'перечень документов']:
+            add_term(t, BOOST_FOR_DOMAIN_TERMS)
+    if 'документ' in q or 'документы' in q:
+        for t in ['документ', 'документы', 'список документов', 'перечень документов']:
+            add_term(t, BOOST_FOR_DOMAIN_TERMS)
+    if 'страхов' in q or 'мед' in q:
+        for t in ['медстраховка', 'медицинская страховка', 'страхование', 'страховой полис']:
+            add_term(t, BOOST_FOR_DOMAIN_TERMS)
+    if 'виза' in q:
+        for t in ['виза', 'национальная виза', 'учебная виза']:
+            add_term(t, BOOST_FOR_DOMAIN_TERMS)
+
+    return list(terms.items())
+
+
 def perform_bm25_search(question: str, k: int = 10) -> List[Dict[str, Any]]:
     """
     Perform BM25 keyword search.
@@ -116,13 +175,35 @@ def perform_bm25_search(question: str, k: int = 10) -> List[Dict[str, Any]]:
         List of search results with BM25 scores
     """
     try:
+        expanded = _expand_query_terms(question)
+        if expanded:
+            should_clauses = [
+                {
+                    "match": {
+                        "text": {
+                            "query": term,
+                            "boost": boost
+                        }
+                    }
+                } for term, boost in expanded
+            ]
+        else:
+            should_clauses = [
+                {
+                    "match": {
+                        "text": {
+                            "query": question,
+                            "boost": BOOST_FOR_OTHER_TERMS
+                        }
+                    }
+                }
+            ]
+
         query = {
             "query": {
-                "match": {
-                    "text": {
-                        "query": question,
-                        "boost": 1.0
-                    }
+                "bool": {
+                    "should": should_clauses,
+                    "minimum_should_match": 1
                 }
             },
             "size": k,
@@ -177,40 +258,59 @@ def combine_search_results(knn_results: List[Dict[str, Any]],
     knn_results = normalize_scores(knn_results, 'knn_score')
     bm25_results = normalize_scores(bm25_results, 'bm25_score')
     
+    # Determine adaptive weights based on BM25 strength across distinct documents
+    strong_bm25_doc_ids = set()
+    for r in bm25_results:
+        if r['bm25_score'] >= BM25_STRONG_SCORE_THRESHOLD and r.get('doc_id'):
+            strong_bm25_doc_ids.add(r['doc_id'])
+    if len(strong_bm25_doc_ids) >= BM25_STRONG_COUNT_THRESHOLD:
+        knn_weight = max(0.0, 1.0 - BM25_WEIGHT_ADAPTIVE)
+        bm25_weight = BM25_WEIGHT_ADAPTIVE
+    else:
+        knn_weight = KNN_WEIGHT_DEFAULT
+        bm25_weight = BM25_WEIGHT_DEFAULT
+
     # Create a dictionary to store combined results
-    combined_dict = {}
+    combined_dict: Dict[str, Dict[str, Any]] = {}
     
     # Add kNN results
     for result in knn_results:
         key = f"{result['doc_id']}_{result['chunk_id']}"
         combined_dict[key] = result.copy()
     
-    # Add BM25 results and combine scores
+    # Add BM25 results and preserve both scores
     for result in bm25_results:
         key = f"{result['doc_id']}_{result['chunk_id']}"
         if key in combined_dict:
-            # Update BM25 score for existing result
             combined_dict[key]['bm25_score'] = result['bm25_score']
         else:
-            # Add new result
             combined_dict[key] = result.copy()
     
     # Calculate final scores with weights
-    KNN_WEIGHT = 0.7
-    BM25_WEIGHT = 0.3
-    
     for result in combined_dict.values():
-        final_score = (KNN_WEIGHT * result['knn_score'] + 
-                      BM25_WEIGHT * result['bm25_score'])
+        final_score = (knn_weight * result['knn_score'] + bm25_weight * result['bm25_score'])
         result['final_score'] = final_score
-        
-        logger.debug(f"Doc {result['doc_id']}: kNN={result['knn_score']:.3f}, "
-                    f"BM25={result['bm25_score']:.3f}, Final={final_score:.3f}")
+        logger.debug(
+            f"Doc {result['doc_id']}: kNN={result['knn_score']:.3f}, BM25={result['bm25_score']:.3f}, Final={final_score:.3f}")
+    
+    # Filter out weak results
+    filtered = [r for r in combined_dict.values() if r['final_score'] >= MIN_SCORE_THRESHOLD]
     
     # Sort by final score and return top k
-    sorted_results = sorted(combined_dict.values(), 
-                           key=lambda x: x['final_score'], 
-                           reverse=True)
+    sorted_results = sorted(filtered, key=lambda x: x['final_score'], reverse=True)
+
+    # Log top-3 merged results at INFO
+    log_preview = []
+    for r in sorted_results[:3]:
+        log_preview.append(
+            {
+                'doc_id': r.get('doc_id', ''),
+                'filename': r.get('filename', ''),
+                'final_score': round(r.get('final_score', 0.0), 3)
+            }
+        )
+    if log_preview:
+        logger.info(f"Top merged results: {log_preview}")
     
     return sorted_results[:k]
 
